@@ -1,0 +1,77 @@
+[project]
+name = "sibparser"
+version = "0.1.0"
+description = "Configurable browser-based parser for ru.siberianhealth.com with Google Drive sync"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Aleksey" }]
+dependencies = [
+    "playwright>=1.49,<2.0",
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    "httpx>=0.27,<1.0",
+    "google-api-python-client>=2.150,<3.0",
+    "google-auth-oauthlib>=1.2,<2.0",
+    "google-auth-httplib2>=0.2,<1.0",
+    "rich>=13.9,<14.0",
+    "typer>=0.13,<1.0",
+    "beautifulsoup4>=4.12,<5.0",
+    "lxml>=5.3,<6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "ruff>=0.7,<1.0",
+    "mypy>=1.13,<2.0",
+    "types-beautifulsoup4>=4.12,<5.0",
+]
+
+[project.scripts]
+sibparser = "sibparser.__main__:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sibparser = ["static/*", "static/**/*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+# RUF001/002/003: ambiguous Cyrillic chars (codebase is Russian-facing).
+# B008:           typer.Option in argument defaults is the documented Typer style.
+# SIM105/SIM108:  many exception swallowers are deliberately written as try/except
+#                 for clarity in scraping code.
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "B008", "SIM105", "SIM108"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+exclude = ["tests/", "scripts/"]
+
+[[tool.mypy.overrides]]
+# google-api-python-client ships partial stubs; many calls are typed as Any.
+module = ["googleapiclient.*", "google_auth_oauthlib.*", "google.*"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

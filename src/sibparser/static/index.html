@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Siberian Health Parser</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <header class="topbar">
+        <h1>Siberian Health Parser</h1>
+        <span class="topbar-sub">Каталог → Google Drive, с дедупом сертификатов</span>
+    </header>
+
+    <main class="layout">
+        <aside class="sidebar">
+            <section class="card">
+                <h2>1. Google Drive</h2>
+                <p id="drive-status" class="muted">Проверяю состояние…</p>
+                <label class="field">
+                    <span>Путь к credentials.json</span>
+                    <input id="credentials-path" type="text" placeholder="./credentials.json" />
+                </label>
+                <button id="auth-btn" class="primary">Войти в Google</button>
+                <p class="hint">
+                    Сначала создай OAuth-клиент в
+                    <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a>
+                    (тип «Desktop app»), скачай credentials.json и положи рядом с проектом.
+                </p>
+            </section>
+
+            <section class="card">
+                <h2>2. Каталог</h2>
+                <button id="discover-btn">Открыть каталог</button>
+                <p class="hint">Откроет браузер, прочитает меню и покажет дерево категорий ниже.</p>
+            </section>
+
+            <section class="card">
+                <h2>3. Один товар</h2>
+                <label class="field">
+                    <span>Прямая ссылка на товар</span>
+                    <input id="single-product" type="text" placeholder="https://ru.siberianhealth.com/ru/shop/catalog/product/400273/" />
+                </label>
+                <button id="single-run-btn">Распарсить только этот товар</button>
+            </section>
+
+            <section class="card">
+                <h2>Опции запуска</h2>
+                <label class="field">
+                    <span>Лимит товаров на категорию (0 = без лимита)</span>
+                    <input id="limit" type="number" value="0" min="0" />
+                </label>
+                <label class="checkbox">
+                    <input id="upload-to-drive" type="checkbox" checked />
+                    <span>Загружать в Google Drive</span>
+                </label>
+                <button id="run-btn" class="primary">Запустить выбранные категории</button>
+                <button id="cancel-btn" class="danger">Стоп</button>
+            </section>
+        </aside>
+
+        <section class="content">
+            <div class="content-header">
+                <h2>Категории</h2>
+                <input id="filter" type="search" placeholder="Поиск по категориям…" />
+            </div>
+            <div id="tree" class="tree"></div>
+
+            <h2>Лог</h2>
+            <div id="log" class="log"></div>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

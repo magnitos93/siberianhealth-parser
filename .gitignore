@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.local
+*.secret
+
+# Google credentials (NEVER commit)
+credentials.json
+token.json
+
+# Local state and downloads
+state.db
+downloads/
+data/
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Exploration / scratch (only big JSON artifacts; we keep the HTML
+# snapshot used by tests, see tests/test_site_parsing.py).
+scripts/_explore/*.json
