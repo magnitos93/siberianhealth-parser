@@ -39,6 +39,24 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 # ---------------------------------------------------------------------------
+# Request models (must live at module scope so FastAPI's get_type_hints()
+# can resolve them — `from __future__ import annotations` turns annotations
+# into strings, and FastAPI looks them up in the function's globals).
+# ---------------------------------------------------------------------------
+
+
+class DriveAuthBody(BaseModel):
+    credentials_path: str | None = None
+
+
+class RunBody(BaseModel):
+    selected_category_paths: list[str] = Field(default_factory=list)
+    single_product_url: str | None = None
+    products_per_category_limit: int = 0
+    upload_to_drive: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Application state
 # ---------------------------------------------------------------------------
 
@@ -106,9 +124,6 @@ def create_app() -> FastAPI:
             "drive_root_folder": cfg.drive_root_folder,
         }
 
-    class DriveAuthBody(BaseModel):
-        credentials_path: str | None = None
-
     @app.post("/api/auth/drive")
     def auth_drive(body: DriveAuthBody) -> dict[str, Any]:
         s: AppState = app.state.app_state
@@ -142,12 +157,6 @@ def create_app() -> FastAPI:
     def categories() -> dict[str, Any]:
         s: AppState = app.state.app_state
         return {"tree": [category_node_to_dict(n) for n in s.tree]}
-
-    class RunBody(BaseModel):
-        selected_category_paths: list[str] = Field(default_factory=list)
-        single_product_url: str | None = None
-        products_per_category_limit: int = 0
-        upload_to_drive: bool = True
 
     @app.post("/api/run")
     def run(body: RunBody) -> dict[str, Any]:
