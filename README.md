@@ -51,6 +51,10 @@ playwright install chromium
 
 ### Веб-UI (рекомендую)
 
+**Windows — двойным кликом:** в папке проекта дважды щёлкни `run.bat`. Он сам активирует окружение и запустит сервер. Откроется окно cmd, дальше открой http://127.0.0.1:8765/ в браузере.
+
+**Из терминала (Win/Mac/Linux):**
+
 ```bash
 sibparser serve
 # или:  python -m sibparser serve
