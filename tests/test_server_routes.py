@@ -56,6 +56,73 @@ def test_run_endpoint_accepts_json_body(client: TestClient, monkeypatch: pytest.
     assert r.json() == {"started": True}
 
 
+def test_run_endpoint_accepts_local_save_options(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """POST /api/run accepts the new save_locally / local_dir / open_folder fields."""
+    from sibparser import runner as runner_mod
+
+    captured: dict[str, runner_mod.RunRequest] = {}
+
+    def _capture_run(self: runner_mod.Runner, request: runner_mod.RunRequest) -> None:
+        captured["req"] = request
+
+    monkeypatch.setattr(runner_mod.Runner, "run", _capture_run)
+
+    body = {
+        "selected_category_paths": ["X"],
+        "upload_to_drive": False,
+        "save_locally": True,
+        "local_dir": str(tmp_path / "custom"),
+        "open_folder_when_done": True,
+    }
+    r = client.post("/api/run", json=body)
+    assert r.status_code == 200, r.text
+
+    # Wait briefly for the background thread to start and capture the request.
+    import time
+    for _ in range(50):
+        if "req" in captured:
+            break
+        time.sleep(0.02)
+    req = captured["req"]
+    assert req.save_locally is True
+    assert req.local_dir == str(tmp_path / "custom")
+    assert req.open_folder_when_done is True
+    assert req.upload_to_drive is False
+
+
+def test_run_endpoint_defaults_to_save_locally_true(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the new fields are omitted, save_locally defaults to True
+    (matches RunBody / RunRequest defaults)."""
+    from sibparser import runner as runner_mod
+
+    captured: dict[str, runner_mod.RunRequest] = {}
+
+    def _capture_run(self: runner_mod.Runner, request: runner_mod.RunRequest) -> None:
+        captured["req"] = request
+
+    monkeypatch.setattr(runner_mod.Runner, "run", _capture_run)
+
+    r = client.post(
+        "/api/run",
+        json={"selected_category_paths": ["X"], "upload_to_drive": False},
+    )
+    assert r.status_code == 200, r.text
+
+    import time
+    for _ in range(50):
+        if "req" in captured:
+            break
+        time.sleep(0.02)
+    req = captured["req"]
+    assert req.save_locally is True
+    assert req.local_dir is None
+    assert req.open_folder_when_done is False
+
+
 def test_drive_auth_endpoint_accepts_json_body(client: TestClient) -> None:
     """POST /api/auth/drive must parse a JSON body, not 422 with loc=query/body."""
     r = client.post("/api/auth/drive", json={"credentials_path": "/no/such/file.json"})

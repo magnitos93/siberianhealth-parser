@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
@@ -35,10 +35,44 @@ from playwright.sync_api import (
     Playwright,
     sync_playwright,
 )
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 HOMEPAGE = "https://ru.siberianhealth.com/ru/"
 CATALOG_URL_RE = re.compile(r"^https?://[^/]+/ru/shop/catalog/[^/]+/?$")
 PRODUCT_URL_RE = re.compile(r"^https?://[^/]+/ru/shop/catalog/product/(\d+)/?")
+
+# Playwright's default navigation timeout is 30s. The Siberian Wellness CDN
+# occasionally serves slow product pages, so we use 90s and retry once on
+# Playwright TimeoutError to absorb transient slowness without breaking the run.
+PAGE_GOTO_TIMEOUT_MS = 90_000
+
+
+_WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
+
+
+def _goto_with_retry(
+    page: Page,
+    url: str,
+    *,
+    timeout_ms: int = PAGE_GOTO_TIMEOUT_MS,
+    retries: int = 1,
+    wait_until: _WaitUntil = "domcontentloaded",
+) -> None:
+    """``page.goto`` wrapper that retries on Playwright TimeoutError."""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            return
+        except PlaywrightTimeoutError as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            page.wait_for_timeout(2000)
+    assert last_exc is not None
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +187,7 @@ class Catalog:
         """Return top-level categories with their children populated."""
         page: Page
         with self.browser.page() as page:
-            page.goto(HOMEPAGE, wait_until="domcontentloaded", timeout=45000)
+            _goto_with_retry(page, HOMEPAGE)
             page.wait_for_timeout(2000)
             self._dismiss_overlays(page)
             try:
@@ -171,7 +205,7 @@ class Catalog:
         seen: set[str] = set()
         page: Page
         with self.browser.page() as page:
-            page.goto(category_url, wait_until="domcontentloaded", timeout=45000)
+            _goto_with_retry(page, category_url)
             page.wait_for_timeout(2000)
             self._dismiss_overlays(page)
 
@@ -346,7 +380,7 @@ class ProductScraper:
     def fetch(self, url: str, max_review_pages: int = 50) -> ProductCard:
         page: Page
         with self.browser.page() as page:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            _goto_with_retry(page, url)
             page.wait_for_timeout(2000)
             Catalog._dismiss_overlays(page)
 

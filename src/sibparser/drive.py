@@ -189,17 +189,24 @@ class DriveClient:
         target_parent_id: str,
         shared_parent_id: str | None = None,
         timeout: float = 60.0,
+        content: bytes | None = None,
     ) -> UploadResult:
-        """Download a remote file and upload it to Drive (with dedup).
+        """Upload a remote file to Drive (with dedup), optionally using
+        pre-downloaded bytes.
 
         Dedup logic (in order):
           1. If we have already seen this exact ``source_url``, create a
              shortcut in the new parent and return.
-          2. Otherwise fetch the bytes, compute SHA-256.
+          2. Otherwise use ``content`` (if provided) or fetch the bytes,
+             then compute SHA-256.
           3. If a file with the same SHA-256 was uploaded before, create a
              shortcut.
           4. Otherwise upload to ``shared_parent_id`` (if given) or directly
              into ``target_parent_id``, and remember the URL+hash.
+
+        Passing ``content`` is useful when the runner already downloaded the
+        bytes for a parallel local copy — it avoids fetching the same file
+        twice over the network.
         """
         existing = self.state.lookup_file_by_url(source_url)
         if existing:
@@ -213,10 +220,11 @@ class DriveClient:
                 sha256=existing.get("sha256"),
             )
 
-        try:
-            content = self._download(source_url, timeout=timeout)
-        except Exception as exc:
-            raise UploadError(f"Failed to download {source_url}: {exc}") from exc
+        if content is None:
+            try:
+                content = self._download(source_url, timeout=timeout)
+            except Exception as exc:
+                raise UploadError(f"Failed to download {source_url}: {exc}") from exc
 
         sha = hashlib.sha256(content).hexdigest()
         existing_hash = self.state.lookup_file_by_sha256(sha)

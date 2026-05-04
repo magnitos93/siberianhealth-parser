@@ -54,6 +54,9 @@ class RunBody(BaseModel):
     single_product_url: str | None = None
     products_per_category_limit: int = 0
     upload_to_drive: bool = True
+    save_locally: bool = True
+    local_dir: str | None = None
+    open_folder_when_done: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +152,15 @@ def create_app() -> FastAPI:
     def discover() -> dict[str, Any]:
         s: AppState = app.state.app_state
         runner = Runner(settings=s.settings, state=s.state, drive=s.drive, progress=s.emit)
-        with s._tree_lock:
-            s.tree = runner.discover_tree()
+        try:
+            with s._tree_lock:
+                s.tree = runner.discover_tree()
+        except Exception as exc:
+            log.exception("discover failed")
+            # Surface the real error message to the UI instead of a generic 500
+            # — the user sees, e.g., "Timeout 90000ms exceeded" rather than just
+            # "Internal Server Error".
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {"tree": [category_node_to_dict(n) for n in s.tree]}
 
     @app.get("/api/categories")
@@ -174,6 +184,9 @@ def create_app() -> FastAPI:
             single_product_url=body.single_product_url,
             products_per_category_limit=body.products_per_category_limit,
             upload_to_drive=body.upload_to_drive,
+            save_locally=body.save_locally,
+            local_dir=body.local_dir,
+            open_folder_when_done=body.open_folder_when_done,
         )
         runner = Runner(
             settings=s.settings,

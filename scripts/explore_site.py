@@ -35,7 +35,7 @@ def main() -> None:
         try:
             page.locator("a, button", has_text="Каталог").first.hover(timeout=5000)
             page.wait_for_timeout(1000)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"hover catalog failed: {exc}")
 
         anchors = page.eval_on_selector_all(

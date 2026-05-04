@@ -8,13 +8,19 @@ status.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
+
+import httpx
 
 from .config import Settings
 from .drive import SHARED_FILES_PATH_SUFFIX, DriveClient, UploadError
@@ -30,6 +36,8 @@ from .site import (
 from .state import State
 
 log = logging.getLogger(__name__)
+
+LOCAL_SHARED_DIR = Path(SHARED_FILES_PATH_SUFFIX) / "certificates"
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +75,15 @@ class RunRequest:
     single_product_url: str | None = None
     # Limit number of products per category (for quick smoke-test runs). 0 = no limit.
     products_per_category_limit: int = 0
-    # Whether to download to Drive (False = parse only and write to local disk).
+    # Whether to upload to Drive (independent of save_locally).
     upload_to_drive: bool = True
+    # Whether to actually download images/PDFs to disk (independent of Drive).
+    # When False with upload_to_drive=False, only URL lists are written.
+    save_locally: bool = True
+    # Override for the local downloads directory. None = use settings.downloads_dir.
+    local_dir: str | None = None
+    # Open the local folder in the OS file manager when the run completes.
+    open_folder_when_done: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +151,7 @@ class Runner:
 
                 if request.single_product_url:
                     self._process_single_product(
-                        product_scraper, request.single_product_url
+                        product_scraper, request.single_product_url, request
                     )
                 else:
                     self._process_category_selection(
@@ -145,11 +160,23 @@ class Runner:
 
             self.state.finish_run(run_id, "ok")
             self._emit("done", "Готово!")
+            if request.open_folder_when_done and request.save_locally:
+                local_root = self._resolve_local_dir(request)
+                try:
+                    _open_in_file_manager(local_root)
+                    self._emit("info", f"Открываю {local_root}")
+                except Exception as exc:
+                    log.warning("open file manager failed: %s", exc)
         except Exception as exc:
             log.exception("run failed")
             self.state.finish_run(run_id, "failed", summary=str(exc))
             self._emit("error", f"Ошибка: {exc}")
             raise
+
+    def _resolve_local_dir(self, request: RunRequest) -> Path:
+        if request.local_dir:
+            return Path(request.local_dir).expanduser()
+        return self.settings.downloads_dir
 
     def _process_category_selection(
         self,
@@ -195,10 +222,10 @@ class Runner:
                 if self._cancel.is_set():
                     self._emit("info", "Отменено пользователем")
                     return
-                self._process_product(product_scraper, url, leaf)
+                self._process_product(product_scraper, url, leaf, request)
 
     def _process_single_product(
-        self, product_scraper: ProductScraper, url: str
+        self, product_scraper: ProductScraper, url: str, request: RunRequest
     ) -> None:
         try:
             card = product_scraper.fetch(url)
@@ -213,13 +240,14 @@ class Runner:
             path="/".join(safe_folder_name(p) for p in crumb_path),
             parent_path="/".join(safe_folder_name(p) for p in crumb_path[:-1]) or None,
         )
-        self._upload_product(card, category)
+        self._handle_product(card, category, request)
 
     def _process_product(
         self,
         product_scraper: ProductScraper,
         url: str,
         category: CategoryNode,
+        request: RunRequest,
     ) -> None:
         # Persist product so we know it exists, even if scrape fails later.
         product_id = _extract_product_id(url) or url
@@ -245,70 +273,172 @@ class Runner:
             reviews=len(card.reviews),
         )
         try:
-            self._upload_product(card, category)
+            self._handle_product(card, category, request)
             self.state.mark_product(url, "ok")
         except Exception as exc:
             self.state.mark_product(url, "failed", error=str(exc))
             self._emit("error", f"    upload failed: {exc}", url=url)
 
-    # -- upload ---------------------------------------------------------
+    # -- save / upload --------------------------------------------------
 
-    def _upload_product(self, card: ProductCard, category: CategoryNode) -> None:
+    def _handle_product(
+        self, card: ProductCard, category: CategoryNode, request: RunRequest
+    ) -> None:
+        """Save info.txt + images + documents to local disk and/or Google Drive.
+
+        Four supported modes (combinations of ``request.save_locally`` and
+        ``self.drive`` being non-None):
+
+        * **Drive only**: upload everything to Drive (legacy behaviour).
+        * **Local only**: download images/PDFs to disk; certificates are
+          deduped via ``<local_dir>/_shared/certificates/`` + hardlink (with
+          copy fallback) so a single physical copy serves all products.
+        * **Both**: download bytes once, save locally, then reuse the bytes
+          for the Drive upload (no duplicate network round-trip).
+        * **Neither**: write ``info.txt`` plus URL lists (``URLS.txt``) so
+          discovery is still useful without fetching binaries.
+        """
         info_text = product_to_info_text(card)
         product_folder_name = safe_folder_name(f"{card.name} [{card.product_id}]")
+        category_parts = [safe_folder_name(p) for p in category.path.split("/") if p]
 
-        if not self.drive:
-            # Local-only mode: write to settings.downloads_dir/<category>/<product>/
-            self._write_local(card, category.path, product_folder_name, info_text)
+        # ------------------------- LOCAL paths -----------------------------
+        local_root: Path | None = None
+        local_product_dir: Path | None = None
+        local_images_dir: Path | None = None
+        local_documents_dir: Path | None = None
+        local_shared_certs: Path | None = None
+        # Always write info.txt locally if we save_locally OR there's no Drive
+        # — otherwise the user has nothing to look at.
+        write_local = request.save_locally or self.drive is None
+        if write_local:
+            local_root = self._resolve_local_dir(request)
+            local_product_dir = local_root / Path(category.path) / product_folder_name
+            local_images_dir = local_product_dir / "images"
+            local_documents_dir = local_product_dir / "documents"
+            local_shared_certs = local_root / LOCAL_SHARED_DIR
+            local_images_dir.mkdir(parents=True, exist_ok=True)
+            local_documents_dir.mkdir(parents=True, exist_ok=True)
+            (local_product_dir / "info.txt").write_text(info_text, encoding="utf-8")
+
+        # ------------------------- DRIVE paths -----------------------------
+        drive_images_id: str | None = None
+        drive_documents_id: str | None = None
+        drive_shared_id: str | None = None
+        if self.drive is not None:
+            product_parent_id = self.drive.ensure_path([*category_parts, product_folder_name])
+            drive_images_id = self.drive.ensure_path(
+                [*category_parts, product_folder_name, "images"]
+            )
+            drive_documents_id = self.drive.ensure_path(
+                [*category_parts, product_folder_name, "documents"]
+            )
+            drive_shared_id = self.drive.ensure_path(
+                [SHARED_FILES_PATH_SUFFIX, "certificates"]
+            )
+            self.drive.upload_text("info.txt", info_text, product_parent_id)
+
+        # ------------------------ no-binary mode ---------------------------
+        if not request.save_locally and self.drive is None:
+            # Discovery-only: write URL lists so the user can review what was
+            # found without paying for downloads.
+            assert local_images_dir is not None and local_documents_dir is not None
+            (local_images_dir / "URLS.txt").write_text(
+                "\n".join(card.image_urls) + "\n", encoding="utf-8"
+            )
+            (local_documents_dir / "URLS.txt").write_text(
+                "\n".join(f"{d['title']}\t{d['url']}" for d in card.document_links) + "\n",
+                encoding="utf-8",
+            )
+            time.sleep(self.settings.request_delay)
             return
 
-        category_parts = [safe_folder_name(p) for p in category.path.split("/") if p]
-        product_parent_id = self.drive.ensure_path([*category_parts, product_folder_name])
-        images_id = self.drive.ensure_path([*category_parts, product_folder_name, "images"])
-        documents_id = self.drive.ensure_path([*category_parts, product_folder_name, "documents"])
-        shared_certs_id = self.drive.ensure_path([SHARED_FILES_PATH_SUFFIX, "certificates"])
-
-        self.drive.upload_text("info.txt", info_text, product_parent_id)
-
+        # ------------------------- IMAGES (no dedup) -----------------------
         for img_url in card.image_urls:
+            name = _filename_from_url(img_url, default=f"{card.product_id}.jpg")
             try:
-                name = _filename_from_url(img_url, default=f"{card.product_id}.jpg")
-                self.drive.upload_or_link(img_url, name, target_parent_id=images_id)
+                self._save_file(
+                    source_url=img_url,
+                    target_name=name,
+                    local_target_dir=local_images_dir if request.save_locally else None,
+                    local_shared_dir=None,
+                    drive_parent_id=drive_images_id,
+                    drive_shared_id=None,
+                )
                 self._emit("file", f"    image {name}")
-            except UploadError as exc:
+            except _FileError as exc:
                 self._emit("error", f"    image failed: {exc}")
 
+        # ------------------------ DOCUMENTS (dedup) ------------------------
         for doc in card.document_links:
+            name = _filename_from_url(
+                doc["url"],
+                default=safe_folder_name(doc.get("title") or "document"),
+            )
             try:
-                name = _filename_from_url(doc["url"], default=f"{doc['title']}")
-                self.drive.upload_or_link(
-                    doc["url"],
-                    name,
-                    target_parent_id=documents_id,
-                    shared_parent_id=shared_certs_id,
+                self._save_file(
+                    source_url=doc["url"],
+                    target_name=name,
+                    local_target_dir=local_documents_dir if request.save_locally else None,
+                    local_shared_dir=local_shared_certs if request.save_locally else None,
+                    drive_parent_id=drive_documents_id,
+                    drive_shared_id=drive_shared_id,
                 )
                 self._emit("file", f"    doc {name}")
-            except UploadError as exc:
+            except _FileError as exc:
                 self._emit("error", f"    doc failed: {exc}")
 
         time.sleep(self.settings.request_delay)
 
-    def _write_local(
+    def _save_file(
         self,
-        card: ProductCard,
-        category_path: str,
-        product_folder_name: str,
-        info_text: str,
+        *,
+        source_url: str,
+        target_name: str,
+        local_target_dir: Path | None,
+        local_shared_dir: Path | None,
+        drive_parent_id: str | None,
+        drive_shared_id: str | None,
     ) -> None:
-        base = self.settings.downloads_dir / Path(category_path) / product_folder_name
-        (base / "images").mkdir(parents=True, exist_ok=True)
-        (base / "documents").mkdir(parents=True, exist_ok=True)
-        (base / "info.txt").write_text(info_text, encoding="utf-8")
-        # Save URL lists so the user can manually fetch if needed.
-        (base / "images" / "URLS.txt").write_text("\n".join(card.image_urls) + "\n")
-        (base / "documents" / "URLS.txt").write_text(
-            "\n".join(f"{d['title']}\t{d['url']}" for d in card.document_links) + "\n"
-        )
+        """Persist ``source_url`` to local disk and/or Google Drive.
+
+        At most one network download per call: when both targets are
+        requested, the downloaded bytes are reused for the Drive upload via
+        the ``content=`` parameter on :meth:`DriveClient.upload_or_link`.
+        """
+        content_cache: bytes | None = None
+
+        if local_target_dir is not None:
+            local_target_dir.mkdir(parents=True, exist_ok=True)
+            local_target = local_target_dir / _safe_filename(target_name)
+
+            if local_target.exists() and local_target.stat().st_size > 0:
+                pass  # already saved on a previous run
+            elif local_shared_dir is not None:
+                # Local dedup: keep one copy in _shared/certificates and
+                # hardlink (or copy) it into each product's folder.
+                local_shared_dir.mkdir(parents=True, exist_ok=True)
+                shared_target = local_shared_dir / _safe_filename(target_name)
+                if not shared_target.exists() or shared_target.stat().st_size == 0:
+                    content_cache = _download_url(source_url)
+                    shared_target.write_bytes(content_cache)
+                _link_or_copy(shared_target, local_target)
+            else:
+                content_cache = _download_url(source_url)
+                local_target.write_bytes(content_cache)
+
+        if drive_parent_id is not None:
+            assert self.drive is not None
+            try:
+                self.drive.upload_or_link(
+                    source_url=source_url,
+                    target_name=target_name,
+                    target_parent_id=drive_parent_id,
+                    shared_parent_id=drive_shared_id,
+                    content=content_cache,
+                )
+            except UploadError as exc:
+                raise _FileError(str(exc)) from exc
 
     # -- helpers --------------------------------------------------------
 
@@ -351,3 +481,67 @@ def _filename_from_url(url: str, default: str) -> str:
     if not name:
         return default
     return name
+
+
+# ---------------------------------------------------------------------------
+# Local file helpers
+# ---------------------------------------------------------------------------
+
+
+# Characters Windows / NTFS reject in filenames.
+_FORBIDDEN_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize a filename for cross-platform filesystem use."""
+    cleaned = _FORBIDDEN_FILENAME_CHARS.sub("_", name).strip(" .")
+    return cleaned or "_"
+
+
+class _FileError(RuntimeError):
+    """Raised when a per-file operation (download / save) fails."""
+
+
+def _download_url(url: str, *, timeout: float = 60.0) -> bytes:
+    """Fetch the bytes of ``url`` via httpx, raising :class:`_FileError`."""
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            r = client.get(url, headers={"User-Agent": "sibparser/0.1"})
+            r.raise_for_status()
+            return r.content
+    except Exception as exc:
+        raise _FileError(f"download {url}: {exc}") from exc
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Hardlink ``src`` to ``dst`` or fall back to copy on different volumes.
+
+    Hardlinks are O(1), use no extra disk space, and look like normal files
+    in Explorer / Finder. They only work if both paths live on the same
+    filesystem; we fall back to a regular copy when the OS refuses (Windows
+    cross-drive scenario, FAT32 USB sticks, etc.).
+    """
+    if dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(str(src), str(dst))
+    except OSError:
+        shutil.copy2(str(src), str(dst))
+
+
+def _open_in_file_manager(path: Path) -> None:
+    """Open ``path`` in the OS file manager (Explorer / Finder / xdg-open)."""
+    if not path.exists():
+        return
+    if sys.platform == "win32":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.run(["open", str(path)], check=False)
+    else:
+        subprocess.run(
+            ["xdg-open", str(path)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )

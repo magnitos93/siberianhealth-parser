@@ -54,6 +54,23 @@
                     <input id="upload-to-drive" type="checkbox" checked />
                     <span>Загружать в Google Drive</span>
                 </label>
+                <label class="checkbox">
+                    <input id="save-locally" type="checkbox" checked />
+                    <span>Сохранять локально (картинки и PDF)</span>
+                </label>
+                <label class="field">
+                    <span>Папка для локального сохранения</span>
+                    <input id="local-dir" type="text" placeholder="downloads" />
+                </label>
+                <label class="checkbox">
+                    <input id="open-folder" type="checkbox" />
+                    <span>Открыть папку в Проводнике после завершения</span>
+                </label>
+                <p class="hint">
+                    Сертификаты (например, «Халяль») хранятся один раз в
+                    <code>_shared/certificates/</code> и связываются с папками товаров
+                    через жёсткие ссылки — место на диске не дублируется.
+                </p>
                 <button id="run-btn" class="primary">Запустить выбранные категории</button>
                 <button id="cancel-btn" class="danger">Стоп</button>
             </section>

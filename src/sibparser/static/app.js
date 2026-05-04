@@ -153,17 +153,66 @@
         }
     });
 
+    // -- Persisted run options ----------------------------------------
+    // We store the user's saving preferences in localStorage so a
+    // configured workflow (e.g. "save to D:\Парсинг, open Explorer when
+    // done") is remembered across sessions of the local UI.
+    const PREFS_KEY = "sibparser.runOpts.v1";
+
+    function loadPrefs() {
+        try {
+            return JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") || {};
+        } catch {
+            return {};
+        }
+    }
+
+    function savePrefs() {
+        const prefs = {
+            uploadToDrive: $("#upload-to-drive").checked,
+            saveLocally: $("#save-locally").checked,
+            localDir: $("#local-dir").value,
+            openFolder: $("#open-folder").checked,
+        };
+        try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch {}
+    }
+
+    function applyPrefs() {
+        const p = loadPrefs();
+        if (typeof p.uploadToDrive === "boolean") $("#upload-to-drive").checked = p.uploadToDrive;
+        if (typeof p.saveLocally === "boolean") $("#save-locally").checked = p.saveLocally;
+        if (typeof p.localDir === "string") $("#local-dir").value = p.localDir;
+        if (typeof p.openFolder === "boolean") $("#open-folder").checked = p.openFolder;
+    }
+
+    function buildRunPayload(extra) {
+        const upload = $("#upload-to-drive").checked;
+        const saveLocally = $("#save-locally").checked;
+        const localDir = $("#local-dir").value.trim();
+        const openFolder = $("#open-folder").checked;
+        savePrefs();
+        return Object.assign({
+            upload_to_drive: upload,
+            save_locally: saveLocally,
+            local_dir: localDir || null,
+            open_folder_when_done: openFolder,
+        }, extra || {});
+    }
+
+    for (const id of ["upload-to-drive", "save-locally", "local-dir", "open-folder"]) {
+        $(`#${id}`).addEventListener("change", savePrefs);
+        $(`#${id}`).addEventListener("input", savePrefs);
+    }
+
     $("#run-btn").addEventListener("click", async () => {
         const paths = selectedCategoryPaths();
         if (!paths.length) { append("Сначала выбери категории галочками", "error"); return; }
         const limit = parseInt($("#limit").value, 10) || 0;
-        const upload = $("#upload-to-drive").checked;
         try {
-            await api("/api/run", {
+            await api("/api/run", buildRunPayload({
                 selected_category_paths: paths,
                 products_per_category_limit: limit,
-                upload_to_drive: upload,
-            });
+            }));
             append(`Запущено для ${paths.length} категорий (лимит ${limit || "∞"})`, "info");
         } catch (err) {
             append(`Запуск: ${err.message}`, "error");
@@ -173,12 +222,10 @@
     $("#single-run-btn").addEventListener("click", async () => {
         const url = $("#single-product").value.trim();
         if (!url) { append("Введи URL товара", "error"); return; }
-        const upload = $("#upload-to-drive").checked;
         try {
-            await api("/api/run", {
+            await api("/api/run", buildRunPayload({
                 single_product_url: url,
-                upload_to_drive: upload,
-            });
+            }));
             append(`Запущено для одного товара: ${url}`, "info");
         } catch (err) {
             append(`Запуск: ${err.message}`, "error");
@@ -191,6 +238,7 @@
     });
 
     // -- init ----------------------------------------------------------
+    applyPrefs();
     refreshStatus();
     connectWs();
 })();
