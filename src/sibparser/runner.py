@@ -4,13 +4,20 @@ The runner is intentionally synchronous and lives on a worker thread so the
 FastAPI server can keep serving HTTP/WebSocket requests. Progress updates are
 sent through a ``ProgressBus`` (an asyncio queue) so connected clients see live
 status.
+
+Output convention: one plain-text ``<product_name>.txt`` per product, sitting
+directly in its category folder. The text file contains all metadata, the full
+"О продукте" description, composition, every review, and **URL lists** of the
+product's images and documents — no binary files are downloaded. This makes
+the resulting tree a flat searchable database for the nutritionist consultant
+who reads the files; image and PDF links open straight from Siberian Wellness'
+CDN when clicked.
 """
 from __future__ import annotations
 
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -18,12 +25,9 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
-
-import httpx
 
 from .config import Settings
-from .drive import SHARED_FILES_PATH_SUFFIX, DriveClient, UploadError
+from .drive import DriveClient
 from .site import (
     Browser,
     Catalog,
@@ -36,8 +40,6 @@ from .site import (
 from .state import State
 
 log = logging.getLogger(__name__)
-
-LOCAL_SHARED_DIR = Path(SHARED_FILES_PATH_SUFFIX) / "certificates"
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +77,9 @@ class RunRequest:
     single_product_url: str | None = None
     # Limit number of products per category (for quick smoke-test runs). 0 = no limit.
     products_per_category_limit: int = 0
-    # Whether to upload to Drive (independent of save_locally).
+    # Whether to upload the product .txt file to Google Drive.
     upload_to_drive: bool = True
-    # Whether to actually download images/PDFs to disk (independent of Drive).
-    # When False with upload_to_drive=False, only URL lists are written.
+    # Whether to write the product .txt file to the local download directory.
     save_locally: bool = True
     # Override for the local downloads directory. None = use settings.downloads_dir.
     local_dir: str | None = None
@@ -284,161 +285,36 @@ class Runner:
     def _handle_product(
         self, card: ProductCard, category: CategoryNode, request: RunRequest
     ) -> None:
-        """Save info.txt + images + documents to local disk and/or Google Drive.
+        """Write the product as a single ``<product_name>.txt`` file.
 
-        Four supported modes (combinations of ``request.save_locally`` and
-        ``self.drive`` being non-None):
+        Output is always identical text. Up to two destinations:
 
-        * **Drive only**: upload everything to Drive (legacy behaviour).
-        * **Local only**: download images/PDFs to disk; certificates are
-          deduped via ``<local_dir>/_shared/certificates/`` + hardlink (with
-          copy fallback) so a single physical copy serves all products.
-        * **Both**: download bytes once, save locally, then reuse the bytes
-          for the Drive upload (no duplicate network round-trip).
-        * **Neither**: write ``info.txt`` plus URL lists (``URLS.txt``) so
-          discovery is still useful without fetching binaries.
+        * **Local**: ``<local_dir>/<category-path>/<safe-product-name>.txt``
+          when ``save_locally=True``.
+        * **Drive**: same file uploaded to ``SiberianHealthParser/<category>/``
+          when ``upload_to_drive=True`` and a Drive client is configured.
+
+        No subfolders, no image/PDF downloads — image and document URLs live
+        inline in the text file (see :func:`product_to_info_text`).
         """
         info_text = product_to_info_text(card)
-        product_folder_name = safe_folder_name(f"{card.name} [{card.product_id}]")
+        file_stem = safe_folder_name(card.name) or f"product-{card.product_id}"
+        file_name = f"{file_stem}.txt"
         category_parts = [safe_folder_name(p) for p in category.path.split("/") if p]
 
-        # ------------------------- LOCAL paths -----------------------------
-        local_root: Path | None = None
-        local_product_dir: Path | None = None
-        local_images_dir: Path | None = None
-        local_documents_dir: Path | None = None
-        local_shared_certs: Path | None = None
-        # Always write info.txt locally if we save_locally OR there's no Drive
-        # — otherwise the user has nothing to look at.
-        write_local = request.save_locally or self.drive is None
-        if write_local:
+        if request.save_locally or self.drive is None:
             local_root = self._resolve_local_dir(request)
-            local_product_dir = local_root / Path(category.path) / product_folder_name
-            local_images_dir = local_product_dir / "images"
-            local_documents_dir = local_product_dir / "documents"
-            local_shared_certs = local_root / LOCAL_SHARED_DIR
-            local_images_dir.mkdir(parents=True, exist_ok=True)
-            local_documents_dir.mkdir(parents=True, exist_ok=True)
-            (local_product_dir / "info.txt").write_text(info_text, encoding="utf-8")
+            local_dir = local_root / Path(*category_parts) if category_parts else local_root
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / _safe_filename(file_name)).write_text(info_text, encoding="utf-8")
+            self._emit("file", f"    txt {file_name}")
 
-        # ------------------------- DRIVE paths -----------------------------
-        drive_images_id: str | None = None
-        drive_documents_id: str | None = None
-        drive_shared_id: str | None = None
-        if self.drive is not None:
-            product_parent_id = self.drive.ensure_path([*category_parts, product_folder_name])
-            drive_images_id = self.drive.ensure_path(
-                [*category_parts, product_folder_name, "images"]
-            )
-            drive_documents_id = self.drive.ensure_path(
-                [*category_parts, product_folder_name, "documents"]
-            )
-            drive_shared_id = self.drive.ensure_path(
-                [SHARED_FILES_PATH_SUFFIX, "certificates"]
-            )
-            self.drive.upload_text("info.txt", info_text, product_parent_id)
-
-        # ------------------------ no-binary mode ---------------------------
-        if not request.save_locally and self.drive is None:
-            # Discovery-only: write URL lists so the user can review what was
-            # found without paying for downloads.
-            assert local_images_dir is not None and local_documents_dir is not None
-            (local_images_dir / "URLS.txt").write_text(
-                "\n".join(card.image_urls) + "\n", encoding="utf-8"
-            )
-            (local_documents_dir / "URLS.txt").write_text(
-                "\n".join(f"{d['title']}\t{d['url']}" for d in card.document_links) + "\n",
-                encoding="utf-8",
-            )
-            time.sleep(self.settings.request_delay)
-            return
-
-        # ------------------------- IMAGES (no dedup) -----------------------
-        for img_url in card.image_urls:
-            name = _filename_from_url(img_url, default=f"{card.product_id}.jpg")
-            try:
-                self._save_file(
-                    source_url=img_url,
-                    target_name=name,
-                    local_target_dir=local_images_dir if request.save_locally else None,
-                    local_shared_dir=None,
-                    drive_parent_id=drive_images_id,
-                    drive_shared_id=None,
-                )
-                self._emit("file", f"    image {name}")
-            except _FileError as exc:
-                self._emit("error", f"    image failed: {exc}")
-
-        # ------------------------ DOCUMENTS (dedup) ------------------------
-        for doc in card.document_links:
-            name = _filename_from_url(
-                doc["url"],
-                default=safe_folder_name(doc.get("title") or "document"),
-            )
-            try:
-                self._save_file(
-                    source_url=doc["url"],
-                    target_name=name,
-                    local_target_dir=local_documents_dir if request.save_locally else None,
-                    local_shared_dir=local_shared_certs if request.save_locally else None,
-                    drive_parent_id=drive_documents_id,
-                    drive_shared_id=drive_shared_id,
-                )
-                self._emit("file", f"    doc {name}")
-            except _FileError as exc:
-                self._emit("error", f"    doc failed: {exc}")
+        if self.drive is not None and request.upload_to_drive:
+            parent_id = self.drive.ensure_path(category_parts) if category_parts else self.drive.ensure_path([])
+            self.drive.upload_text(file_name, info_text, parent_id)
+            self._emit("file", f"    drive {file_name}")
 
         time.sleep(self.settings.request_delay)
-
-    def _save_file(
-        self,
-        *,
-        source_url: str,
-        target_name: str,
-        local_target_dir: Path | None,
-        local_shared_dir: Path | None,
-        drive_parent_id: str | None,
-        drive_shared_id: str | None,
-    ) -> None:
-        """Persist ``source_url`` to local disk and/or Google Drive.
-
-        At most one network download per call: when both targets are
-        requested, the downloaded bytes are reused for the Drive upload via
-        the ``content=`` parameter on :meth:`DriveClient.upload_or_link`.
-        """
-        content_cache: bytes | None = None
-
-        if local_target_dir is not None:
-            local_target_dir.mkdir(parents=True, exist_ok=True)
-            local_target = local_target_dir / _safe_filename(target_name)
-
-            if local_target.exists() and local_target.stat().st_size > 0:
-                pass  # already saved on a previous run
-            elif local_shared_dir is not None:
-                # Local dedup: keep one copy in _shared/certificates and
-                # hardlink (or copy) it into each product's folder.
-                local_shared_dir.mkdir(parents=True, exist_ok=True)
-                shared_target = local_shared_dir / _safe_filename(target_name)
-                if not shared_target.exists() or shared_target.stat().st_size == 0:
-                    content_cache = _download_url(source_url)
-                    shared_target.write_bytes(content_cache)
-                _link_or_copy(shared_target, local_target)
-            else:
-                content_cache = _download_url(source_url)
-                local_target.write_bytes(content_cache)
-
-        if drive_parent_id is not None:
-            assert self.drive is not None
-            try:
-                self.drive.upload_or_link(
-                    source_url=source_url,
-                    target_name=target_name,
-                    target_parent_id=drive_parent_id,
-                    shared_parent_id=drive_shared_id,
-                    content=content_cache,
-                )
-            except UploadError as exc:
-                raise _FileError(str(exc)) from exc
 
     # -- helpers --------------------------------------------------------
 
@@ -474,20 +350,6 @@ def _extract_product_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _filename_from_url(url: str, default: str) -> str:
-    parsed = urlparse(url)
-    name = Path(parsed.path).name or default
-    name = re.sub(r"[\x00-\x1f]", "", name)
-    if not name:
-        return default
-    return name
-
-
-# ---------------------------------------------------------------------------
-# Local file helpers
-# ---------------------------------------------------------------------------
-
-
 # Characters Windows / NTFS reject in filenames.
 _FORBIDDEN_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
@@ -496,38 +358,6 @@ def _safe_filename(name: str) -> str:
     """Sanitize a filename for cross-platform filesystem use."""
     cleaned = _FORBIDDEN_FILENAME_CHARS.sub("_", name).strip(" .")
     return cleaned or "_"
-
-
-class _FileError(RuntimeError):
-    """Raised when a per-file operation (download / save) fails."""
-
-
-def _download_url(url: str, *, timeout: float = 60.0) -> bytes:
-    """Fetch the bytes of ``url`` via httpx, raising :class:`_FileError`."""
-    try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            r = client.get(url, headers={"User-Agent": "sibparser/0.1"})
-            r.raise_for_status()
-            return r.content
-    except Exception as exc:
-        raise _FileError(f"download {url}: {exc}") from exc
-
-
-def _link_or_copy(src: Path, dst: Path) -> None:
-    """Hardlink ``src`` to ``dst`` or fall back to copy on different volumes.
-
-    Hardlinks are O(1), use no extra disk space, and look like normal files
-    in Explorer / Finder. They only work if both paths live on the same
-    filesystem; we fall back to a regular copy when the OS refuses (Windows
-    cross-drive scenario, FAT32 USB sticks, etc.).
-    """
-    if dst.exists():
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(str(src), str(dst))
-    except OSError:
-        shutil.copy2(str(src), str(dst))
 
 
 def _open_in_file_manager(path: Path) -> None:

@@ -107,10 +107,12 @@ class ProductCard:
     breadcrumbs: list[str]
     series: str | None
     article: str | None
-    volume: str | None
+    volume: str | None  # «Количество в упаковке», e.g. "30 пакетов по 5 капсул"
     price: str | None
+    points: str | None  # Bonus points, e.g. "82б"
+    short_description: str  # The blurb directly under the H1
     description_html: str
-    description_text: str
+    description_text: str  # Full "О продукте" tab content (works on image-rich pages)
     composition_html: str
     composition_text: str
     reviews: list[dict[str, str]]
@@ -478,26 +480,49 @@ def _parse_product_html(url: str, html: str, reviews: list[dict[str, str]]) -> P
         if parent is not None:
             series = parent.get_text(" ", strip=True).removeprefix("Серия:").strip()
 
-    article = None
-    for el in soup.select(".im21--product-info__article, .product-article, .im21--product-main__article"):
-        text = el.get_text(" ", strip=True)
-        m2 = re.search(r"#?(\d{4,})", text)
-        if m2:
-            article = m2.group(1)
-            break
+    # Article + «Количество в упаковке» live in identical
+    # ``.im21--product-options__option`` blocks, distinguished by the
+    # ``__title`` text node. Parse them in one pass.
+    article: str | None = None
+    volume: str | None = None
+    for opt in soup.select(".im21--product-options__option"):
+        title_el = opt.select_one(".im21--product-options__title")
+        value_el = opt.select_one(".im21--product-options__value")
+        if title_el is None or value_el is None:
+            continue
+        title = title_el.get_text(" ", strip=True).rstrip(":").lower()
+        value = value_el.get_text(" ", strip=True)
+        if not value:
+            continue
+        if "артикул" in title:
+            m2 = re.search(r"\d{4,}", value)
+            article = m2.group(0) if m2 else value
+        elif "количество" in title or "объ" in title:
+            volume = value
     if not article:
         article = product_id
 
-    volume = _text_of(soup.select_one(".im21--product-info__volume, .product-volume"))
-    price = _text_of(soup.select_one(".im21--product-main__price, .im21--product-price__current, .product-price__current"))
+    price = _text_of(
+        soup.select_one(".im21--product-info__price, .im21--product-main__price, .im21--product-price__current")
+    )
+    points = _text_of(soup.select_one(".im21--product-info__points")) or None
+    short_description = _text_of(soup.select_one(".im21--product-info__description"))
 
-    about_pane = soup.select_one(".im21--product-detail__about, .im21--product-about")
+    # The ``О продукте`` tab pane is the reliable source for the long
+    # description — it works for both plain-text pages and the newer
+    # image-heavy layouts (where ``__about`` only contains "Документы").
+    about_pane = soup.select_one(
+        ".im21--product-detail__tab-content, .im21--product-detail__about, .im21--product-about"
+    )
     description_html = str(about_pane) if about_pane else ""
     description_text = _text_of(about_pane)
 
     comp_pane = soup.select_one(".im21--product-detail__composition, .im21--product-composition")
     composition_html = str(comp_pane) if comp_pane else ""
     composition_text = _text_of(comp_pane)
+    # The composition pane includes a leading "Состав" heading — strip it so
+    # the info file isn't redundant under its own ``СОСТАВ`` section.
+    composition_text = re.sub(r"^\s*Состав\s*", "", composition_text, count=1).strip()
 
     image_urls: list[str] = []
     for img in soup.select(".im21--product-slider__img"):
@@ -532,6 +557,8 @@ def _parse_product_html(url: str, html: str, reviews: list[dict[str, str]]) -> P
         article=article,
         volume=volume,
         price=price,
+        points=points,
+        short_description=short_description,
         description_html=description_html,
         description_text=description_text,
         composition_html=composition_html,
@@ -577,7 +604,13 @@ def category_node_to_dict(node: CategoryNode) -> dict[str, Any]:
 
 
 def product_to_info_text(card: ProductCard) -> str:
-    """Render a product into the human-friendly ``info.txt`` body."""
+    """Render a product into the single-file plain-text body.
+
+    Output convention is one ``<product_name>.txt`` per product, containing
+    every field, every review, and **URL lists** of images and documents
+    (no actual binaries). The format is optimized for nutrionist consultants
+    reading the file as a database — search is easy, links are clickable.
+    """
     lines: list[str] = []
     lines.append(f"Название: {card.name}")
     lines.append(f"URL: {card.url}")
@@ -587,15 +620,24 @@ def product_to_info_text(card: ProductCard) -> str:
     if card.series:
         lines.append(f"Серия: {card.series}")
     if card.volume:
-        lines.append(f"Объём: {card.volume}")
+        lines.append(f"Количество в упаковке: {card.volume}")
     if card.price:
         lines.append(f"Цена: {card.price}")
+    if card.points:
+        lines.append(f"Баллы: {card.points}")
     if card.breadcrumbs:
         lines.append(f"Категория: {' > '.join(card.breadcrumbs)}")
 
+    if card.short_description:
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("КРАТКОЕ ОПИСАНИЕ")
+        lines.append("=" * 60)
+        lines.append(card.short_description)
+
     lines.append("")
     lines.append("=" * 60)
-    lines.append("ОПИСАНИЕ")
+    lines.append("О ПРОДУКТЕ")
     lines.append("=" * 60)
     lines.append(card.description_text or "—")
 
@@ -613,6 +655,14 @@ def product_to_info_text(card: ProductCard) -> str:
         header_parts = [p for p in (r.get("author"), r.get("date"), r.get("rating")) if p]
         lines.append(f"--- Отзыв #{i} {' | '.join(header_parts)} ---")
         lines.append(r.get("text", ""))
+        lines.append("")
+
+    if card.image_urls:
+        lines.append("=" * 60)
+        lines.append(f"ИЗОБРАЖЕНИЯ ({len(card.image_urls)})")
+        lines.append("=" * 60)
+        for u in card.image_urls:
+            lines.append(f"- {u}")
         lines.append("")
 
     if card.document_links:

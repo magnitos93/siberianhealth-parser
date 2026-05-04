@@ -56,7 +56,7 @@
                 </label>
                 <label class="checkbox">
                     <input id="save-locally" type="checkbox" checked />
-                    <span>Сохранять локально (картинки и PDF)</span>
+                    <span>Сохранять локально</span>
                 </label>
                 <label class="field">
                     <span>Папка для локального сохранения</span>
@@ -67,9 +67,10 @@
                     <span>Открыть папку в Проводнике после завершения</span>
                 </label>
                 <p class="hint">
-                    Сертификаты (например, «Халяль») хранятся один раз в
-                    <code>_shared/certificates/</code> и связываются с папками товаров
-                    через жёсткие ссылки — место на диске не дублируется.
+                    Каждый товар сохраняется как один текстовый файл
+                    <code>&lt;Название&gt;.txt</code> прямо в папке категории.
+                    Внутри файла — все поля, отзывы и ссылки на картинки и PDF
+                    (по клику открываются с CDN Siberian Wellness).
                 </p>
                 <button id="run-btn" class="primary">Запустить выбранные категории</button>
                 <button id="cancel-btn" class="danger">Стоп</button>
